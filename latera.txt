@@ -73,16 +73,39 @@ fetch_page <- function(uuid, filter_list, offset, size = 5000, polite_sleep = 0.
   as_tibble(dat)
 }
 
-# Sequential paginator: stop when a short page appears
-fetch_all_for_filter <- function(uuid, filter_list, page_size = 5000) {
-  out <- list(); offset <- 0L
+# Sequential paginator with safety limits and a CPT validation check to avoid
+# pulling the full dataset when a filter is ignored by the API.
+fetch_all_for_filter <- function(uuid, filter_list, cpt_code, page_size = 5000, max_pages = 20) {
+  out <- list(); offset <- 0L; page_idx <- 1L
+  code_candidates <- c("HCPCS_Cd", "Rndrng_Prvdr_HCPCS_Cd", "HCPCS_CD")
+
   repeat {
     page <- fetch_page(uuid, filter_list, offset, size = page_size)
     if (nrow(page) == 0) break
+
+    if (page_idx == 1) {
+      code_col <- intersect(code_candidates, names(page))[1]
+      if (!is.na(code_col)) {
+        # If the first page does not contain the requested CPT code, treat this
+        # as a failed filter to avoid walking the entire dataset.
+        if (!cpt_code %in% unique(page[[code_col]])) {
+          message(sprintf("    ⚠ First page missing CPT %s in column %s; abandoning this filter", cpt_code, code_col))
+          return(tibble())
+        }
+      }
+    }
+
     out[[length(out) + 1]] <- page
     if (nrow(page) < page_size) break
+    if (page_idx >= max_pages) {
+      message(sprintf("    ⚠ Hit max_pages=%d for this filter; stopping pagination", max_pages))
+      break
+    }
+
     offset <- offset + page_size
+    page_idx <- page_idx + 1L
   }
+
   if (length(out) == 0) tibble() else bind_rows(out)
 }
 
@@ -112,7 +135,7 @@ get_year_data <- function(year, uuid, cpt_code, cpt_label) {
   for (i in seq_along(possible_filters)) {
     tryCatch({
       message(sprintf("    Trying filter variant %d...", i))
-      year_df <- fetch_all_for_filter(uuid, possible_filters[[i]])
+      year_df <- fetch_all_for_filter(uuid, possible_filters[[i]], cpt_code)
       if (nrow(year_df) > 0) {
         message(sprintf("    ✓ Success with filter variant %d! Retrieved %d records", i, nrow(year_df)))
         break
