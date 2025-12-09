@@ -1,0 +1,198 @@
+
+# Query physicians performing Latera surgeries (CPT 30468)
+# Filter for those with ≥10 procedures annually on average (2021-2023)
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+
+# Year-specific UUIDs for PSPS data (physician-level)
+year_uuid_map <- list(
+  "2023" = "0e9f2f2b-7bf9-451a-912c-e02e654dd725",
+  "2022" = "e650987d-01b7-4f09-b75e-b0b075afbf98",
+  "2021" = "31dc2c47-f297-4948-bfb4-075e1bec3a02"
+)
+
+base_url_template <- "https://data.cms.gov/data-api/v1/dataset/%s/data"
+
+# Latera CPT code
+CPT_LATERA <- "30468"
+
+cat("\n")
+cat("================================================================\n")
+cat("  Querying High-Volume Latera Physicians (2021-2023)\n")
+cat("================================================================\n\n")
+
+# ---- Robust GET with retries/timeouts/backoff --------------------------------
+retry_GET <- function(url, query_list, max_attempts = 6, pause_secs = 2, req_timeout = 120) {
+  attempt <- 1
+  repeat {
+    res <- tryCatch(
+      GET(url, query = query_list, timeout(req_timeout)),
+      error = function(e) e
+    )
+    if (inherits(res, "error")) {
+      if (attempt >= max_attempts) stop(res)
+      message(sprintf("Retry %d - %s; sleeping %d sec...", attempt, conditionMessage(res), pause_secs))
+      Sys.sleep(pause_secs); pause_secs <- min(pause_secs * 2, 60); attempt <- attempt + 1
+      next
+    }
+    if (status_code(res) == 503) {
+      if (attempt >= max_attempts) stop("Max retry attempts reached due to 503 error.")
+      message(sprintf("Retry %d - 503 Error; sleeping %d sec...", attempt, pause_secs))
+      Sys.sleep(pause_secs); pause_secs <- min(pause_secs * 2, 60); attempt <- attempt + 1
+      next
+    }
+    stop_for_status(res)
+    return(res)
+  }
+}
+
+fetch_page <- function(uuid, filter_list, offset, size = 5000, polite_sleep = 0.2) {
+  full_url <- sprintf(base_url_template, uuid)
+  query_params <- c(list("size" = size, "offset" = offset), filter_list)
+  res <- retry_GET(full_url, query_params)
+  raw <- content(res, as = "text", encoding = "UTF-8")
+  dat <- fromJSON(raw, flatten = TRUE)
+  if (is.null(dat) || length(dat) == 0) dat <- tibble()
+  Sys.sleep(polite_sleep)
+  as_tibble(dat)
+}
+
+# Sequential paginator: stop when a short page appears
+fetch_all_for_filter <- function(uuid, filter_list, page_size = 5000) {
+  out <- list(); offset <- 0L
+  repeat {
+    page <- fetch_page(uuid, filter_list, offset, size = page_size)
+    if (nrow(page) == 0) break
+    out[[length(out) + 1]] <- page
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+  }
+  if (length(out) == 0) tibble() else bind_rows(out)
+}
+
+dedupe_year <- function(df) {
+  if (nrow(df) == 0) return(df)
+  key_cols <- intersect(c(
+    "Rndrng_NPI", "Rndrng_Prvdr_Type",
+    "HCPCS_Cd", "HCPCS_Desc",
+    "Rndrng_Prvdr_Ent_Cd", "Rndrng_Prvdr_Geo_Lvl",
+    "Rndrng_Prvdr_State_Abrvtn", "Rndrng_Prvdr_City"
+  ), names(df))
+  if (length(key_cols) >= 2) distinct(df, across(all_of(key_cols)), .keep_all = TRUE) else distinct(df)
+}
+
+get_year_data <- function(year, uuid, cpt_code) {
+  message(sprintf("==== Year %s ====", year))
+  
+  # Query for specific CPT code (Latera)
+  message(sprintf("  Pulling CPT %s (Latera) procedures...", cpt_code))
+  
+  # Try different possible column names for HCPCS code
+  possible_filters <- list(
+    list("filter[HCPCS_Cd]" = cpt_code),
+    list("filter[Rndrng_Prvdr_HCPCS_Cd]" = cpt_code),
+    list("filter[HCPCS_CD]" = cpt_code)
+  )
+  
+  year_df <- tibble()
+  
+  for (i in seq_along(possible_filters)) {
+    tryCatch({
+      message(sprintf("    Trying filter variant %d...", i))
+      year_df <- fetch_all_for_filter(uuid, possible_filters[[i]])
+      if (nrow(year_df) > 0) {
+        message(sprintf("    ✓ Success with filter variant %d! Retrieved %d records", i, nrow(year_df)))
+        break
+      }
+    }, error = function(e) {
+      message(sprintf("    Filter variant %d failed: %s", i, conditionMessage(e)))
+    })
+  }
+  
+  if (nrow(year_df) == 0) {
+    message("  ⚠ No records retrieved for this year")
+    return(tibble())
+  }
+  
+  year_df <- dedupe_year(year_df)
+  year_df$Year <- year
+  
+  message(sprintf("  Retrieved %d unique records for year %s", nrow(year_df), year))
+  return(year_df)
+}
+
+# ------------------------ QUERY ALL YEARS --------------------------------------
+all_data_list <- list()
+
+for (yr in names(year_uuid_map)) {
+  uuid <- year_uuid_map[[yr]]
+  yr_data <- tryCatch(
+    get_year_data(yr, uuid, CPT_LATERA),
+    error = function(e) {
+      message(sprintf("  ERROR in year %s: %s", yr, conditionMessage(e)))
+      tibble()
+    }
+  )
+  all_data_list[[yr]] <- yr_data
+}
+
+combined_data <- bind_rows(all_data_list)
+
+cat("\n")
+cat("================================================================\n")
+cat("  Query Complete - Processing Results\n")
+cat("================================================================\n\n")
+
+cat(sprintf("Total records retrieved: %d\n", nrow(combined_data)))
+cat(sprintf("Unique physicians: %d\n", length(unique(combined_data$Rndrng_NPI))))
+cat("\n")
+
+if (nrow(combined_data) == 0) {
+  stop("No data retrieved. Check if the API endpoint or filter format is correct.")
+}
+
+# Display column names to verify
+cat("Available columns:\n")
+print(names(combined_data))
+cat("\n")
+
+# ------------------------ PROCESS AND FILTER -----------------------------------
+
+# Identify the services column (different possible names)
+services_col <- grep("Tot.*Srvcs|Line.*Srvc.*Cnt|Srvcs", 
+                     names(combined_data), 
+                     ignore.case = TRUE, 
+                     value = TRUE)[1]
+
+payment_col <- grep("Tot.*Pymt|Tot.*Mdcr.*Pymt|Payment", 
+                    names(combined_data), 
+                    ignore.case = TRUE, 
+                    value = TRUE)[1]
+
+if (is.na(services_col)) {
+  cat("Available columns for inspection:\n")
+  print(names(combined_data))
+  stop("Could not identify services column. Please check column names above.")
+}
+
+cat(sprintf("Using services column: %s\n", services_col))
+if (!is.na(payment_col)) {
+  cat(sprintf("Using payment column: %s\n", payment_col))
+}
+cat("\n")
+
+# Standardize column names
+latera_data <- combined_data %>%
+  rename(
+    NPI = Rndrng_NPI,
+    Services = !!services_col
+  ) %>%
+  mutate(
+    NPI = as.character(NPI),
+    Services = as.numeric(Services),
+    Year = as.numeric(Year)
+  )
+
