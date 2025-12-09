@@ -1,5 +1,5 @@
-# Query PSPS (Physician/Supplier Procedure Summary) for nasal valve, rhinoplasty (major septal repair), and Latera procedures (CPT 30465/30420/30468)
-# Summarize PSPS_NCH_PAYMENT_AMT from 2014-2024 and visualize totals via stacked bar chart
+# Query physicians performing nasal valve, rhinoplasty (major septal repair), and Latera procedures (CPT 30465/30420/30468)
+# Summarize volume/spending and visualize totals from 2014-2024
 
 library(httr)
 library(jsonlite)
