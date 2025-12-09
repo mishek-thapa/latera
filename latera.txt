@@ -1,11 +1,12 @@
-# Query physicians performing nasal valve, rhinoplasty (major septal repair), and Latera procedures (CPT 30465/30420/30468)
-# Summarize volume/spending and visualize totals from 2014-2024
+# Query PSPS (Physician/Supplier Procedure Summary) for nasal valve, rhinoplasty (major septal repair), and Latera procedures (CPT 30465/30420/30468)
+# Summarize PSPS_NCH_PAYMENT_AMT from 2014-2024 and visualize totals via stacked bar chart
 
 library(httr)
 library(jsonlite)
 library(dplyr)
 library(purrr)
 library(ggplot2)
+library(tidyr)
 
 # Year-specific UUIDs for the PSPS dataset (physician/supplier procedure summary)
 year_uuid_map <- list(
@@ -234,6 +235,25 @@ latera_data <- combined_data %>%
     Year = as.numeric(Year)
   )
 
+# CPI-U annual averages (BLS) for 2014-2024; 2024 value uses the latest available
+# year-to-date average to express all dollars in 2024 terms.
+cpi_table <- tribble(
+  ~Year, ~CPI,
+  2014, 236.736,
+  2015, 237.017,
+  2016, 240.007,
+  2017, 245.120,
+  2018, 251.107,
+  2019, 255.657,
+  2020, 258.811,
+  2021, 270.970,
+  2022, 292.655,
+  2023, 305.710,
+  2024, 314.000
+)
+
+cpi_2024 <- cpi_table %>% filter(Year == 2024) %>% pull(CPI)
+
 summary_by_year_cpt <- latera_data %>%
   group_by(Year, CPT_Code, CPT_Label) %>%
   summarise(
@@ -241,13 +261,29 @@ summary_by_year_cpt <- latera_data %>%
     Total_Payments = if ("Payment" %in% names(.)) sum(Payment, na.rm = TRUE) else NA_real_,
     .groups = "drop"
   ) %>%
+  right_join(cpt_catalog %>% mutate(Year = list(names(year_uuid_map))) %>% unnest(Year),
+             by = c("CPT_Code", "CPT_Label", "Year")) %>%
+  mutate(
+    Year = as.numeric(Year),
+    Total_Services = replace_na(Total_Services, 0),
+    Total_Payments = replace_na(Total_Payments, 0)
+  ) %>%
   arrange(Year, CPT_Code)
+
+summary_by_year_cpt <- summary_by_year_cpt %>%
+  left_join(cpi_table, by = "Year") %>%
+  mutate(
+    Inflation_Factor_2024 = cpi_2024 / CPI,
+    Total_Payments_2024 = Total_Payments * Inflation_Factor_2024
+  ) %>%
+  select(-CPI)
 
 overall_summary <- summary_by_year_cpt %>%
   group_by(Year) %>%
   summarise(
     Total_Services = sum(Total_Services, na.rm = TRUE),
     Total_Payments = sum(Total_Payments, na.rm = TRUE),
+    Total_Payments_2024 = sum(Total_Payments_2024, na.rm = TRUE),
     .groups = "drop"
   )
 
@@ -264,14 +300,27 @@ if ("Total_Payments" %in% names(summary_by_year_cpt) && any(!is.na(summary_by_ye
       title = "PSPS Medicare Payments by CPT Code (2014-2024)",
       subtitle = "PSPS_NCH_PAYMENT_AMT stacked across nasal valve repair, rhinoplasty with major septal repair, and Latera implantation",
       x = "Year",
-      y = "Total Payments (PSPS_NCH_PAYMENT_AMT)",
+      y = "Total Payments (nominal)",
+      fill = "CPT"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  adj_plot <- ggplot(summary_by_year_cpt, aes(x = factor(Year), y = Total_Payments_2024, fill = CPT_Label)) +
+    geom_col(color = "grey20") +
+    labs(
+      title = "Inflation-Adjusted PSPS Medicare Payments (2014-2024)",
+      subtitle = "Nominal PSPS_NCH_PAYMENT_AMT converted to 2024 dollars using CPI-U",
+      x = "Year",
+      y = "Total Payments (2024 $)",
       fill = "CPT"
     ) +
     theme_minimal(base_size = 12) +
     theme(legend.position = "bottom")
 
   ggsave("plots/cpt_payments_2014_2024.png", stacked_plot, width = 10, height = 6, dpi = 320)
-  cat("\nStacked bar chart saved to plots/cpt_payments_2014_2024.png\n")
+  ggsave("plots/cpt_payments_2014_2024_inflation_adjusted.png", adj_plot, width = 10, height = 6, dpi = 320)
+  cat("\nStacked bar charts saved to: \n  - plots/cpt_payments_2014_2024.png (nominal)\n  - plots/cpt_payments_2014_2024_inflation_adjusted.png (2024 dollars)\n")
 } else {
   cat("\nSkipped plotting because payment totals were unavailable.\n")
 }
