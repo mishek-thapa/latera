@@ -1,27 +1,40 @@
-
-# Query physicians performing Latera surgeries (CPT 30468)
-# Filter for those with ≥10 procedures annually on average (2021-2023)
+# Query PSPS (Physician/Supplier Procedure Summary) for nasal valve, rhinoplasty (major septal repair), and Latera procedures (CPT 30465/30420/30468)
+# Summarize PSPS_NCH_PAYMENT_AMT from 2014-2024 and visualize totals via stacked bar chart
 
 library(httr)
 library(jsonlite)
 library(dplyr)
 library(purrr)
+library(ggplot2)
+library(tidyr)
 
-# Year-specific UUIDs for PSPS data (physician-level)
+# Year-specific UUIDs for the PSPS dataset (physician/supplier procedure summary)
 year_uuid_map <- list(
-  "2023" = "0e9f2f2b-7bf9-451a-912c-e02e654dd725",
-  "2022" = "e650987d-01b7-4f09-b75e-b0b075afbf98",
-  "2021" = "31dc2c47-f297-4948-bfb4-075e1bec3a02"
+  "2024" = "647c8fa8-5dd6-460d-a2ec-18faf15b3fb2",
+  "2023" = "b72adfb6-22cf-4241-9c64-050ad9061e03",
+  "2022" = "e4786716-10e9-40f2-b936-7444177474d5",
+  "2021" = "72200613-6706-4ad2-8219-e200cc4391cc",
+  "2020" = "5eb3eebe-20cb-405c-864f-444873134f24",
+  "2019" = "0ce67ad8-524b-4d4f-8ac8-55f4a68f0711",
+  "2018" = "6056deb7-17a7-49bc-a5b3-c799b4f91568",
+  "2017" = "3060244e-269e-4442-a983-8c190adfe7f1",
+  "2016" = "b8a1bee7-62b2-44eb-8585-0c257a3d8c3f",
+  "2015" = "f8392bbd-981b-4ea6-b9f9-0891825105d7",
+  "2014" = "3d28f6b0-e9df-48ea-b2eb-5cac10eaaf45"
 )
 
 base_url_template <- "https://data.cms.gov/data-api/v1/dataset/%s/data"
 
-# Latera CPT code
-CPT_LATERA <- "30468"
+cpt_catalog <- tribble(
+  ~CPT_Code, ~CPT_Label,
+  "30465", "Nasal valve repair",
+  "30420", "Rhinoplasty w/ major septal repair",
+  "30468", "Latera implantation"
+)
 
 cat("\n")
 cat("================================================================\n")
-cat("  Querying High-Volume Latera Physicians (2021-2023)\n")
+cat("  Querying PSPS Nasal Valve/Rhinoplasty/Latera (2014-2024)\n")
 cat("================================================================\n\n")
 
 # ---- Robust GET with retries/timeouts/backoff --------------------------------
@@ -60,49 +73,61 @@ fetch_page <- function(uuid, filter_list, offset, size = 5000, polite_sleep = 0.
   as_tibble(dat)
 }
 
-# Sequential paginator: stop when a short page appears
-fetch_all_for_filter <- function(uuid, filter_list, page_size = 5000) {
-  out <- list(); offset <- 0L
+# Sequential paginator with safety limits and a CPT validation check to avoid
+# pulling the full dataset when a filter is ignored by the API.
+fetch_all_for_filter <- function(uuid, filter_list, cpt_code, page_size = 5000, max_pages = 20) {
+  out <- list(); offset <- 0L; page_idx <- 1L
+  code_candidates <- c("HCPCS_CD", "HCPCS_Cd", "Rndrng_Prvdr_HCPCS_Cd")
+
   repeat {
     page <- fetch_page(uuid, filter_list, offset, size = page_size)
     if (nrow(page) == 0) break
+
+    if (page_idx == 1) {
+      code_col <- intersect(code_candidates, names(page))[1]
+      if (!is.na(code_col)) {
+        if (!cpt_code %in% unique(page[[code_col]])) {
+          message(sprintf("    ⚠ First page missing CPT %s in column %s; abandoning this filter", cpt_code, code_col))
+          return(tibble())
+        }
+      }
+    }
+
     out[[length(out) + 1]] <- page
     if (nrow(page) < page_size) break
+    if (page_idx >= max_pages) {
+      message(sprintf("    ⚠ Hit max_pages=%d for this filter; stopping pagination", max_pages))
+      break
+    }
+
     offset <- offset + page_size
+    page_idx <- page_idx + 1L
   }
+
   if (length(out) == 0) tibble() else bind_rows(out)
 }
 
 dedupe_year <- function(df) {
   if (nrow(df) == 0) return(df)
-  key_cols <- intersect(c(
-    "Rndrng_NPI", "Rndrng_Prvdr_Type",
-    "HCPCS_Cd", "HCPCS_Desc",
-    "Rndrng_Prvdr_Ent_Cd", "Rndrng_Prvdr_Geo_Lvl",
-    "Rndrng_Prvdr_State_Abrvtn", "Rndrng_Prvdr_City"
-  ), names(df))
+  key_cols <- intersect(c("HCPCS_CD", "CARRIER_NUM", "PRICING_LOCALITY_CD", "TYPE_OF_SERVICE_CD", "PLACE_OF_SERVICE_CD"), names(df))
   if (length(key_cols) >= 2) distinct(df, across(all_of(key_cols)), .keep_all = TRUE) else distinct(df)
 }
 
-get_year_data <- function(year, uuid, cpt_code) {
-  message(sprintf("==== Year %s ====", year))
-  
-  # Query for specific CPT code (Latera)
-  message(sprintf("  Pulling CPT %s (Latera) procedures...", cpt_code))
-  
-  # Try different possible column names for HCPCS code
+get_year_data <- function(year, uuid, cpt_code, cpt_label) {
+  message(sprintf("==== Year %s | CPT %s (%s) ====", year, cpt_code, cpt_label))
+
   possible_filters <- list(
+    list("filter[HCPCS_CD]" = cpt_code),
     list("filter[HCPCS_Cd]" = cpt_code),
-    list("filter[Rndrng_Prvdr_HCPCS_Cd]" = cpt_code),
-    list("filter[HCPCS_CD]" = cpt_code)
+    list("filter[Rndrng_Prvdr_HCPCS_Cd]" = cpt_code)
   )
-  
+
   year_df <- tibble()
-  
+
   for (i in seq_along(possible_filters)) {
     tryCatch({
       message(sprintf("    Trying filter variant %d...", i))
-      year_df <- fetch_all_for_filter(uuid, possible_filters[[i]])
+      year_df <- fetch_all_for_filter(uuid, possible_filters[[i]], cpt_code)
       if (nrow(year_df) > 0) {
         message(sprintf("    ✓ Success with filter variant %d! Retrieved %d records", i, nrow(year_df)))
         break
@@ -111,35 +136,58 @@ get_year_data <- function(year, uuid, cpt_code) {
       message(sprintf("    Filter variant %d failed: %s", i, conditionMessage(e)))
     })
   }
-  
+
   if (nrow(year_df) == 0) {
     message("  ⚠ No records retrieved for this year")
     return(tibble())
   }
-  
+
   year_df <- dedupe_year(year_df)
   year_df$Year <- year
-  
+
   message(sprintf("  Retrieved %d unique records for year %s", nrow(year_df), year))
   return(year_df)
 }
 
-# ------------------------ QUERY ALL YEARS --------------------------------------
-all_data_list <- list()
+# ------------------------ QUERY ALL YEARS/CODES --------------------------------
+all_cpt_data <- list()
 
-for (yr in names(year_uuid_map)) {
-  uuid <- year_uuid_map[[yr]]
-  yr_data <- tryCatch(
-    get_year_data(yr, uuid, CPT_LATERA),
-    error = function(e) {
-      message(sprintf("  ERROR in year %s: %s", yr, conditionMessage(e)))
-      tibble()
+for (i in seq_len(nrow(cpt_catalog))) {
+  cpt_code <- cpt_catalog$CPT_Code[i]
+  cpt_label <- cpt_catalog$CPT_Label[i]
+
+  message(sprintf("\n========= Pulling CPT %s (%s) =========", cpt_code, cpt_label))
+  annual_data <- list()
+
+  for (yr in names(year_uuid_map)) {
+    uuid <- year_uuid_map[[yr]]
+    if (is.null(uuid) || is.na(uuid) || uuid == "") {
+      message(sprintf("Skipping year %s (UUID missing)", yr))
+      next
     }
-  )
-  all_data_list[[yr]] <- yr_data
+
+    yr_data <- tryCatch(
+      get_year_data(yr, uuid, cpt_code, cpt_label),
+      error = function(e) {
+        message(sprintf("  ERROR in year %s: %s", yr, conditionMessage(e)))
+        tibble()
+      }
+    )
+    annual_data[[yr]] <- yr_data
+  }
+
+  cpt_data <- bind_rows(annual_data)
+  if (nrow(cpt_data) == 0) {
+    message(sprintf("No data for CPT %s (%s)", cpt_code, cpt_label))
+    next
+  }
+
+  cpt_data$CPT_Code <- cpt_code
+  cpt_data$CPT_Label <- cpt_label
+  all_cpt_data[[cpt_code]] <- cpt_data
 }
 
-combined_data <- bind_rows(all_data_list)
+combined_data <- bind_rows(all_cpt_data)
 
 cat("\n")
 cat("================================================================\n")
@@ -147,52 +195,132 @@ cat("  Query Complete - Processing Results\n")
 cat("================================================================\n\n")
 
 cat(sprintf("Total records retrieved: %d\n", nrow(combined_data)))
-cat(sprintf("Unique physicians: %d\n", length(unique(combined_data$Rndrng_NPI))))
+cat(sprintf("CPT codes represented: %s\n", paste(unique(combined_data$CPT_Code), collapse = ", ")))
 cat("\n")
 
 if (nrow(combined_data) == 0) {
   stop("No data retrieved. Check if the API endpoint or filter format is correct.")
 }
 
-# Display column names to verify
 cat("Available columns:\n")
 print(names(combined_data))
 cat("\n")
 
-# ------------------------ PROCESS AND FILTER -----------------------------------
+service_candidates <- c("PSPS_SUBMITTED_SERVICE_CNT", grep("service", names(combined_data), ignore.case = TRUE, value = TRUE))
+payment_candidates <- c("PSPS_NCH_PAYMENT_AMT", grep("payment|pymt", names(combined_data), ignore.case = TRUE, value = TRUE))
 
-# Identify the services column (different possible names)
-services_col <- grep("Tot.*Srvcs|Line.*Srvc.*Cnt|Srvcs", 
-                     names(combined_data), 
-                     ignore.case = TRUE, 
-                     value = TRUE)[1]
-
-payment_col <- grep("Tot.*Pymt|Tot.*Mdcr.*Pymt|Payment", 
-                    names(combined_data), 
-                    ignore.case = TRUE, 
-                    value = TRUE)[1]
+services_col <- intersect(service_candidates, names(combined_data))[1]
+payment_col <- intersect(payment_candidates, names(combined_data))[1]
 
 if (is.na(services_col)) {
-  cat("Available columns for inspection:\n")
-  print(names(combined_data))
-  stop("Could not identify services column. Please check column names above.")
+  stop("Could not identify a services column.")
 }
 
 cat(sprintf("Using services column: %s\n", services_col))
 if (!is.na(payment_col)) {
   cat(sprintf("Using payment column: %s\n", payment_col))
+} else {
+  cat("No payment column detected; totals will only include service counts.\n")
 }
 cat("\n")
 
-# Standardize column names
 latera_data <- combined_data %>%
   rename(
-    NPI = Rndrng_NPI,
-    Services = !!services_col
+    Services = !!services_col,
+    Payment = !!payment_col
   ) %>%
   mutate(
-    NPI = as.character(NPI),
     Services = as.numeric(Services),
+    Payment = as.numeric(Payment),
     Year = as.numeric(Year)
   )
 
+# CPI-U annual averages (BLS) for 2014-2024; 2024 value uses the latest available
+# year-to-date average to express all dollars in 2024 terms.
+cpi_table <- tribble(
+  ~Year, ~CPI,
+  2014, 236.736,
+  2015, 237.017,
+  2016, 240.007,
+  2017, 245.120,
+  2018, 251.107,
+  2019, 255.657,
+  2020, 258.811,
+  2021, 270.970,
+  2022, 292.655,
+  2023, 305.710,
+  2024, 314.000
+)
+
+cpi_2024 <- cpi_table %>% filter(Year == 2024) %>% pull(CPI)
+
+summary_by_year_cpt <- latera_data %>%
+  group_by(Year, CPT_Code, CPT_Label) %>%
+  summarise(
+    Total_Services = sum(Services, na.rm = TRUE),
+    Total_Payments = if ("Payment" %in% names(.)) sum(Payment, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  right_join(cpt_catalog %>% mutate(Year = list(names(year_uuid_map))) %>% unnest(Year),
+             by = c("CPT_Code", "CPT_Label", "Year")) %>%
+  mutate(
+    Year = as.numeric(Year),
+    Total_Services = replace_na(Total_Services, 0),
+    Total_Payments = replace_na(Total_Payments, 0)
+  ) %>%
+  arrange(Year, CPT_Code)
+
+summary_by_year_cpt <- summary_by_year_cpt %>%
+  left_join(cpi_table, by = "Year") %>%
+  mutate(
+    Inflation_Factor_2024 = cpi_2024 / CPI,
+    Total_Payments_2024 = Total_Payments * Inflation_Factor_2024
+  ) %>%
+  select(-CPI)
+
+overall_summary <- summary_by_year_cpt %>%
+  group_by(Year) %>%
+  summarise(
+    Total_Services = sum(Total_Services, na.rm = TRUE),
+    Total_Payments = sum(Total_Payments, na.rm = TRUE),
+    Total_Payments_2024 = sum(Total_Payments_2024, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Summary (by CPT):\n")
+print(summary_by_year_cpt)
+cat("\nOverall summary (all CPTs):\n")
+print(overall_summary)
+
+if ("Total_Payments" %in% names(summary_by_year_cpt) && any(!is.na(summary_by_year_cpt$Total_Payments))) {
+  dir.create("plots", showWarnings = FALSE)
+  stacked_plot <- ggplot(summary_by_year_cpt, aes(x = factor(Year), y = Total_Payments, fill = CPT_Label)) +
+    geom_col(color = "grey20") +
+    labs(
+      title = "PSPS Medicare Payments by CPT Code (2014-2024)",
+      subtitle = "PSPS_NCH_PAYMENT_AMT stacked across nasal valve repair, rhinoplasty with major septal repair, and Latera implantation",
+      x = "Year",
+      y = "Total Payments (nominal)",
+      fill = "CPT"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  adj_plot <- ggplot(summary_by_year_cpt, aes(x = factor(Year), y = Total_Payments_2024, fill = CPT_Label)) +
+    geom_col(color = "grey20") +
+    labs(
+      title = "Inflation-Adjusted PSPS Medicare Payments (2014-2024)",
+      subtitle = "Nominal PSPS_NCH_PAYMENT_AMT converted to 2024 dollars using CPI-U",
+      x = "Year",
+      y = "Total Payments (2024 $)",
+      fill = "CPT"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave("plots/cpt_payments_2014_2024.png", stacked_plot, width = 10, height = 6, dpi = 320)
+  ggsave("plots/cpt_payments_2014_2024_inflation_adjusted.png", adj_plot, width = 10, height = 6, dpi = 320)
+  cat("\nStacked bar charts saved to: \n  - plots/cpt_payments_2014_2024.png (nominal)\n  - plots/cpt_payments_2014_2024_inflation_adjusted.png (2024 dollars)\n")
+} else {
+  cat("\nSkipped plotting because payment totals were unavailable.\n")
+}
