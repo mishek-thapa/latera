@@ -7,20 +7,19 @@ library(dplyr)
 library(purrr)
 library(ggplot2)
 
-# Year-specific UUIDs for PSPS data (physician-level)
-# NOTE: Fill in the missing UUIDs for 2014-2020 and 2024 when available.
+# Year-specific UUIDs for the PSPS dataset (physician/supplier procedure summary)
 year_uuid_map <- list(
-  "2024" = NA_character_,
-  "2023" = "0e9f2f2b-7bf9-451a-912c-e02e654dd725",
-  "2022" = "e650987d-01b7-4f09-b75e-b0b075afbf98",
-  "2021" = "31dc2c47-f297-4948-bfb4-075e1bec3a02",
-  "2020" = NA_character_,
-  "2019" = NA_character_,
-  "2018" = NA_character_,
-  "2017" = NA_character_,
-  "2016" = NA_character_,
-  "2015" = NA_character_,
-  "2014" = NA_character_
+  "2024" = "647c8fa8-5dd6-460d-a2ec-18faf15b3fb2",
+  "2023" = "b72adfb6-22cf-4241-9c64-050ad9061e03",
+  "2022" = "e4786716-10e9-40f2-b936-7444177474d5",
+  "2021" = "72200613-6706-4ad2-8219-e200cc4391cc",
+  "2020" = "5eb3eebe-20cb-405c-864f-444873134f24",
+  "2019" = "0ce67ad8-524b-4d4f-8ac8-55f4a68f0711",
+  "2018" = "6056deb7-17a7-49bc-a5b3-c799b4f91568",
+  "2017" = "3060244e-269e-4442-a983-8c190adfe7f1",
+  "2016" = "b8a1bee7-62b2-44eb-8585-0c257a3d8c3f",
+  "2015" = "f8392bbd-981b-4ea6-b9f9-0891825105d7",
+  "2014" = "3d28f6b0-e9df-48ea-b2eb-5cac10eaaf45"
 )
 
 base_url_template <- "https://data.cms.gov/data-api/v1/dataset/%s/data"
@@ -34,7 +33,7 @@ cpt_catalog <- tribble(
 
 cat("\n")
 cat("================================================================\n")
-cat("  Querying Nasal Valve/Rhinoplasty/Latera Physicians (2014-2024)\n")
+cat("  Querying PSPS Nasal Valve/Rhinoplasty/Latera (2014-2024)\n")
 cat("================================================================\n\n")
 
 # ---- Robust GET with retries/timeouts/backoff --------------------------------
@@ -77,7 +76,7 @@ fetch_page <- function(uuid, filter_list, offset, size = 5000, polite_sleep = 0.
 # pulling the full dataset when a filter is ignored by the API.
 fetch_all_for_filter <- function(uuid, filter_list, cpt_code, page_size = 5000, max_pages = 20) {
   out <- list(); offset <- 0L; page_idx <- 1L
-  code_candidates <- c("HCPCS_Cd", "Rndrng_Prvdr_HCPCS_Cd", "HCPCS_CD")
+  code_candidates <- c("HCPCS_CD", "HCPCS_Cd", "Rndrng_Prvdr_HCPCS_Cd")
 
   repeat {
     page <- fetch_page(uuid, filter_list, offset, size = page_size)
@@ -86,8 +85,6 @@ fetch_all_for_filter <- function(uuid, filter_list, cpt_code, page_size = 5000, 
     if (page_idx == 1) {
       code_col <- intersect(code_candidates, names(page))[1]
       if (!is.na(code_col)) {
-        # If the first page does not contain the requested CPT code, treat this
-        # as a failed filter to avoid walking the entire dataset.
         if (!cpt_code %in% unique(page[[code_col]])) {
           message(sprintf("    ⚠ First page missing CPT %s in column %s; abandoning this filter", cpt_code, code_col))
           return(tibble())
@@ -111,23 +108,17 @@ fetch_all_for_filter <- function(uuid, filter_list, cpt_code, page_size = 5000, 
 
 dedupe_year <- function(df) {
   if (nrow(df) == 0) return(df)
-  key_cols <- intersect(c(
-    "Rndrng_NPI", "Rndrng_Prvdr_Type",
-    "HCPCS_Cd", "HCPCS_Desc",
-    "Rndrng_Prvdr_Ent_Cd", "Rndrng_Prvdr_Geo_Lvl",
-    "Rndrng_Prvdr_State_Abrvtn", "Rndrng_Prvdr_City"
-  ), names(df))
+  key_cols <- intersect(c("HCPCS_CD", "CARRIER_NUM", "PRICING_LOCALITY_CD", "TYPE_OF_SERVICE_CD", "PLACE_OF_SERVICE_CD"), names(df))
   if (length(key_cols) >= 2) distinct(df, across(all_of(key_cols)), .keep_all = TRUE) else distinct(df)
 }
 
 get_year_data <- function(year, uuid, cpt_code, cpt_label) {
   message(sprintf("==== Year %s | CPT %s (%s) ====", year, cpt_code, cpt_label))
 
-  # Try different possible column names for HCPCS code
   possible_filters <- list(
+    list("filter[HCPCS_CD]" = cpt_code),
     list("filter[HCPCS_Cd]" = cpt_code),
-    list("filter[Rndrng_Prvdr_HCPCS_Cd]" = cpt_code),
-    list("filter[HCPCS_CD]" = cpt_code)
+    list("filter[Rndrng_Prvdr_HCPCS_Cd]" = cpt_code)
   )
 
   year_df <- tibble()
@@ -203,7 +194,6 @@ cat("  Query Complete - Processing Results\n")
 cat("================================================================\n\n")
 
 cat(sprintf("Total records retrieved: %d\n", nrow(combined_data)))
-cat(sprintf("Unique physicians: %d\n", length(unique(combined_data$Rndrng_NPI))))
 cat(sprintf("CPT codes represented: %s\n", paste(unique(combined_data$CPT_Code), collapse = ", ")))
 cat("\n")
 
@@ -211,28 +201,18 @@ if (nrow(combined_data) == 0) {
   stop("No data retrieved. Check if the API endpoint or filter format is correct.")
 }
 
-# Display column names to verify
 cat("Available columns:\n")
 print(names(combined_data))
 cat("\n")
 
-# ------------------------ PROCESS AND FILTER -----------------------------------
+service_candidates <- c("PSPS_SUBMITTED_SERVICE_CNT", grep("service", names(combined_data), ignore.case = TRUE, value = TRUE))
+payment_candidates <- c("PSPS_NCH_PAYMENT_AMT", grep("payment|pymt", names(combined_data), ignore.case = TRUE, value = TRUE))
 
-# Identify the services column (different possible names)
-services_col <- grep("Tot.*Srvcs|Line.*Srvc.*Cnt|Srvcs",
-                     names(combined_data),
-                     ignore.case = TRUE,
-                     value = TRUE)[1]
-
-payment_col <- grep("Tot.*Pymt|Tot.*Mdcr.*Pymt|Payment",
-                    names(combined_data),
-                    ignore.case = TRUE,
-                    value = TRUE)[1]
+services_col <- intersect(service_candidates, names(combined_data))[1]
+payment_col <- intersect(payment_candidates, names(combined_data))[1]
 
 if (is.na(services_col)) {
-  cat("Available columns for inspection:\n")
-  print(names(combined_data))
-  stop("Could not identify services column. Please check column names above.")
+  stop("Could not identify a services column.")
 }
 
 cat(sprintf("Using services column: %s\n", services_col))
@@ -245,22 +225,14 @@ cat("\n")
 
 latera_data <- combined_data %>%
   rename(
-    NPI = Rndrng_NPI,
-    Services = !!services_col
+    Services = !!services_col,
+    Payment = !!payment_col
   ) %>%
   mutate(
-    NPI = as.character(NPI),
     Services = as.numeric(Services),
+    Payment = as.numeric(Payment),
     Year = as.numeric(Year)
   )
-
-if (!is.na(payment_col)) {
-  latera_data <- latera_data %>%
-    rename(Payment = !!payment_col) %>%
-    mutate(Payment = as.numeric(Payment))
-}
-
-# ------------------------ SUMMARIES & VISUALS ----------------------------------
 
 summary_by_year_cpt <- latera_data %>%
   group_by(Year, CPT_Code, CPT_Label) %>%
@@ -289,10 +261,10 @@ if ("Total_Payments" %in% names(summary_by_year_cpt) && any(!is.na(summary_by_ye
   stacked_plot <- ggplot(summary_by_year_cpt, aes(x = factor(Year), y = Total_Payments, fill = CPT_Label)) +
     geom_col(color = "grey20") +
     labs(
-      title = "Total Medicare Payments by CPT Code (2014-2024)",
-      subtitle = "Stacked by nasal valve repair, rhinoplasty with major septal repair, and Latera implantation",
+      title = "PSPS Medicare Payments by CPT Code (2014-2024)",
+      subtitle = "PSPS_NCH_PAYMENT_AMT stacked across nasal valve repair, rhinoplasty with major septal repair, and Latera implantation",
       x = "Year",
-      y = "Total Payments",
+      y = "Total Payments (PSPS_NCH_PAYMENT_AMT)",
       fill = "CPT"
     ) +
     theme_minimal(base_size = 12) +
